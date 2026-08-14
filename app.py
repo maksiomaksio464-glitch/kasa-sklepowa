@@ -1,27 +1,62 @@
+import os
 import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from flask import Flask, render_template_string, request, redirect, url_for, session
 
 app = Flask(__name__)
-app.secret_key = "super_tajny_kluczyk_systemu_pos"
+app.secret_key = os.environ.get("SECRET_KEY", "super_tajny_kluczyk_systemu_pos")
 
-# Ustawienie hasła administratora
-ADMIN_PASSWORD = "13990"
-
+# Konfiguracja Połączenia z Bazą Danych (Supabase / PostgreSQL lub fallback do SQLite)
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 def get_db_connection():
-    conn = sqlite3.connect("sklep.db")
-    conn.row_factory = sqlite3.Row
-    return conn
+    if DATABASE_URL:
+        # Połączenie z Supabase (PostgreSQL)
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        return conn
+    else:
+        # Połączenie lokalne (SQLite)
+        conn = sqlite3.connect("sklep.db")
+        conn.row_factory = sqlite3.Row
+        return conn
 
+def execute_query(query, params=(), fetchone=False, fetchall=False, commit=False):
+    conn = get_db_connection()
+    is_postgres = DATABASE_URL is not None
+    
+    # Zamiana składni SQL ze stylu SQLite (?) na Postgres ($1, $2 lub %s)
+    if is_postgres:
+        query = query.replace("?", "%s")
+
+    cursor = conn.cursor()
+    cursor.execute(query, params)
+    
+    result = None
+    if fetchone:
+        result = cursor.fetchone()
+    elif fetchall:
+        result = cursor.fetchall()
+        
+    if commit or not is_postgres:
+        conn.commit()
+        
+    cursor.close()
+    conn.close()
+    return result
 
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
+    is_postgres = DATABASE_URL is not None
+
+    auto_inc = "SERIAL PRIMARY KEY" if is_postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    dt_default = "CURRENT_TIMESTAMP"
 
     # Tabela produktów
-    cursor.execute("""
+    cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS produkty (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {auto_inc},
             nazwa TEXT NOT NULL,
             kod_kreskowy TEXT UNIQUE NOT NULL,
             cena REAL NOT NULL,
@@ -30,10 +65,10 @@ def init_db():
     """)
 
     # Tabela transakcji
-    cursor.execute("""
+    cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS transakcje (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            data_czas DATETIME DEFAULT CURRENT_TIMESTAMP,
+            id {auto_inc},
+            data_czas TIMESTAMP DEFAULT {dt_default},
             suma REAL NOT NULL,
             metoda_platnosci TEXT NOT NULL,
             wplacono REAL DEFAULT 0,
@@ -42,9 +77,9 @@ def init_db():
     """)
 
     # Tabela pozycji transakcji
-    cursor.execute("""
+    cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS transakcje_pozycje (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {auto_inc},
             transakcja_id INTEGER NOT NULL,
             nazwa_produktu TEXT NOT NULL,
             cena_jednostkowa REAL NOT NULL,
@@ -54,9 +89,25 @@ def init_db():
         )
     """)
 
+    # Tabela ustawień (przechowywanie hasła admina)
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS ustawienia (
+            klucz TEXT PRIMARY KEY,
+            wartosc TEXT NOT NULL
+        )
+    """)
+
+    # Inicjalizacja domyślnego hasła admina
+    cursor.execute("SELECT wartosc FROM ustawienia WHERE klucz = 'admin_password'" if not is_postgres else "SELECT wartosc FROM ustawienia WHERE klucz = %s", ('admin_password',))
+    if not cursor.fetchone():
+        cursor.execute("INSERT INTO ustawienia (klucz, wartosc) VALUES (%s, %s)" if is_postgres else "INSERT INTO ustawienia (klucz, wartosc) VALUES (?, ?)", ('admin_password', '13990'))
+
     # Przykładowe dane początkowe
     cursor.execute("SELECT COUNT(*) FROM produkty")
-    if cursor.fetchone()[0] == 0:
+    count = cursor.fetchone()
+    total_prod = count['count'] if is_postgres else count[0]
+
+    if total_prod == 0:
         przykładowe_produkty = [
             ("Mleko 3.2%", "5901234567890", 3.99, "Nabiał"),
             ("Chleb Wiejski", "5909876543210", 4.50, "Pieczywo"),
@@ -64,16 +115,18 @@ def init_db():
             ("Kawa Mielona 500g", "5901111222333", 24.99, "Artykuły spożywcze"),
             ("Czekolada Mleczna", "5907777888999", 5.49, "Słodycze")
         ]
-        cursor.executemany(
-            "INSERT INTO produkty (nazwa, kod_kreskowy, cena, kategoria) VALUES (?, ?, ?, ?)",
-            przykładowe_produkty
-        )
+        for p in przykładowe_produkty:
+            cursor.execute("INSERT INTO produkty (nazwa, kod_kreskowy, cena, kategoria) VALUES (%s, %s, %s, %s)" if is_postgres else "INSERT INTO produkty (nazwa, kod_kreskowy, cena, kategoria) VALUES (?, ?, ?, ?)", p)
 
     conn.commit()
+    cursor.close()
     conn.close()
 
-
 init_db()
+
+def get_admin_password():
+    res = execute_query("SELECT wartosc FROM ustawienia WHERE klucz = ?", ('admin_password',), fetchone=True)
+    return res['wartosc'] if res else "13990"
 
 # Main HTML Layout Template
 HTML_LAYOUT = """
@@ -113,6 +166,7 @@ HTML_LAYOUT = """
             {% if session.get('admin') %}
                 <a href="/admin">⚙️ Panel Admina</a>
                 <a href="/admin/transakcje">📜 Transakcje</a>
+                <a href="/admin/zmien-haslo">🔑 Zmień Hasło</a>
                 <a href="/admin/logout">🚪 Wyloguj</a>
             {% else %}
                 <a href="/admin/login">🔒 Logowanie Admin</a>
@@ -138,9 +192,7 @@ def home():
     koszyk = session["koszyk"]
     suma = sum(item["cena"] * item["ilosc"] for item in koszyk)
 
-    conn = get_db_connection()
-    produkty = conn.execute("SELECT * FROM produkty").fetchall()
-    conn.close()
+    produkty = execute_query("SELECT * FROM produkty ORDER BY nazwa ASC", fetchall=True)
 
     pozycje_html = ""
     for i, item in enumerate(koszyk):
@@ -155,10 +207,10 @@ def home():
         """
 
     produkty_options = ""
-    for p in produkty:
-        produkty_options += f'<option value="{p["kod_kreskowy"]}">{p["nazwa"]} - {p["cena"]:.2f} zł (Kod: {p["kod_kreskowy"]})</option>'
+    if produkty:
+        for p in produkty:
+            produkty_options += f'<option value="{p["kod_kreskowy"]}">{p["nazwa"]} - {p["cena"]:.2f} zł (Kod: {p["kod_kreskowy"]})</option>'
 
-    # Obsługa widoczności formularza płatności bezpośrednio w Pythonie
     formularz_platnosci = ""
     if koszyk:
         formularz_platnosci = """
@@ -223,15 +275,14 @@ def home():
     """
     return render_template_string(HTML_LAYOUT, content=content)
 
+
 @app.route("/dodaj_do_koszyka", methods=["POST"])
 def dodaj_do_koszyka():
     kod = request.form.get("kod_kreskowy", "").strip()
     if not kod:
         return redirect(url_for("home"))
 
-    conn = get_db_connection()
-    prod = conn.execute("SELECT * FROM produkty WHERE kod_kreskowy = ?", (kod,)).fetchone()
-    conn.close()
+    prod = execute_query("SELECT * FROM produkty WHERE kod_kreskowy = ?", (kod,), fetchone=True)
 
     if prod:
         koszyk = session.get("koszyk", [])
@@ -245,13 +296,62 @@ def dodaj_do_koszyka():
             koszyk.append({
                 "kod_kreskowy": prod["kod_kreskowy"],
                 "nazwa": prod["nazwa"],
-                "cena": prod["cena"],
+                "cena": float(prod["cena"]),
                 "ilosc": 1
             })
         session["koszyk"] = koszyk
     return redirect(url_for("home"))
 
+
+@app.route("/usun_z_koszyka/<int:index>")
+def usun_z_koszyka(index):
+    koszyk = session.get("koszyk", [])
+    if 0 <= index < len(koszyk):
+        koszyk.pop(index)
+        session["koszyk"] = koszyk
+    return redirect(url_for("home"))
+
+
+@app.route("/czysc_koszyk")
+def czysc_koszyk():
+    session["koszyk"] = []
+    return redirect(url_for("home"))
+
+
+@app.route("/platnosc", methods=["POST"])
+def platnosc():
+    koszyk = session.get("koszyk", [])
+    if not koszyk:
+        return redirect(url_for("home"))
+
+    metoda = request.form.get("metoda", "Karta")
+    wplacono_raw = request.form.get("wplacono", "0").replace(",", ".")
+    wplacono = float(wplacono_raw) if wplacono_raw else 0.0
+
+    suma = sum(item["cena"] * item["ilosc"] for item in koszyk)
+    reszta = wplacono - suma if metoda == "Gotówka" and wplacono >= suma else 0.0
+
+    conn = get_db_connection()
+    is_postgres = DATABASE_URL is not None
+    cursor = conn.cursor()
+
+    sql_trans = "INSERT INTO transakcje (suma, metoda_platnosci, wplacono, reszta) VALUES (%s, %s, %s, %s) RETURNING id" if is_postgres else "INSERT INTO transakcje (suma, metoda_platnosci, wplacono, reszta) VALUES (?, ?, ?, ?)"
+    
+    if is_postgres:
+        cursor.execute(sql_trans, (suma, metoda, wplacono, reszta))
+        transakcja_id = cursor.fetchone()['id']
+    else:
+        cursor.execute(sql_trans, (suma, metoda, wplacono, reszta))
+        transakcja_id = cursor.lastrowid
+
+    sql_item = "INSERT INTO transakcje_pozycje (transakcja_id, nazwa_produktu, cena_jednostkowa, ilosc, wartosc) VALUES (%s, %s, %s, %s, %s)" if is_postgres else "INSERT INTO transakcje_pozycje (transakcja_id, nazwa_produktu, cena_jednostkowa, ilosc, wartosc) VALUES (?, ?, ?, ?, ?)"
+
+    for item in koszyk:
+        wartosc = item["cena"] * item["ilosc"]
+        cursor.execute(sql_item, (transakcja_id, item["nazwa"], item["cena"], item["ilosc"], wartosc))
+
     conn.commit()
+    cursor.close()
     conn.close()
 
     session["ostatnia_transakcja"] = {"id": transakcja_id}
@@ -261,14 +361,14 @@ def dodaj_do_koszyka():
 
 
 # ----------------------------------------------------
-# PANEL ADMINISTRATORA
+# PANEL ADMINISTRATORA & ZMIANA HASŁA
 # ----------------------------------------------------
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
     error = ""
     if request.method == "POST":
         haslo = request.form.get("haslo")
-        if haslo == ADMIN_PASSWORD:
+        if haslo == get_admin_password():
             session["admin"] = True
             return redirect(url_for("admin_panel"))
         else:
@@ -290,6 +390,53 @@ def admin_login():
     return render_template_string(HTML_LAYOUT, content=content)
 
 
+@app.route("/admin/zmien-haslo", methods=["GET", "POST"])
+def admin_zmien_haslo():
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
+
+    error = ""
+    success = ""
+    if request.method == "POST":
+        stare_haslo = request.form.get("stare_haslo")
+        nowe_haslo = request.form.get("nowe_haslo")
+        powtorz_haslo = request.form.get("powtorz_haslo")
+
+        if stare_haslo != get_admin_password():
+            error = "❌ Stare hasło jest nieprawidłowe!"
+        elif nowe_haslo != powtorz_haslo:
+            error = "❌ Nowe hasła nie są identyczne!"
+        elif len(nowe_haslo) < 3:
+            error = "❌ Hasło jest za krótkie!"
+        else:
+            execute_query("UPDATE ustawienia SET wartosc = ? WHERE klucz = 'admin_password'", (nowe_haslo,), commit=True)
+            success = "✅ Hasło zostało zmienione pomyślnie!"
+
+    content = f"""
+        <div style="max-width: 450px; margin: 30px auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+            <h2>🔑 Zmiana Hasła Administratora</h2>
+            {f'<div class="alert alert-error">{error}</div>' if error else ''}
+            {f'<div class="alert alert-success">{success}</div>' if success else ''}
+            <form method="POST">
+                <div style="margin-bottom: 15px;">
+                    <label><b>Obecne hasło:</b></label><br>
+                    <input type="password" name="stare_haslo" style="width: 100%; margin-top: 5px;" required>
+                </div>
+                <div style="margin-bottom: 15px;">
+                    <label><b>Nowe hasło:</b></label><br>
+                    <input type="password" name="nowe_haslo" style="width: 100%; margin-top: 5px;" required>
+                </div>
+                <div style="margin-bottom: 20px;">
+                    <label><b>Powtórz nowe hasło:</b></label><br>
+                    <input type="password" name="powtorz_haslo" style="width: 100%; margin-top: 5px;" required>
+                </div>
+                <button type="submit" class="btn btn-green" style="width: 100%;">Zapisz Nowe Hasło</button>
+            </form>
+        </div>
+    """
+    return render_template_string(HTML_LAYOUT, content=content)
+
+
 @app.route("/admin/logout")
 def admin_logout():
     session.pop("admin", None)
@@ -301,25 +448,24 @@ def admin_panel():
     if not session.get("admin"):
         return redirect(url_for("admin_login"))
 
-    conn = get_db_connection()
-    produkty = conn.execute("SELECT * FROM produkty").fetchall()
-    conn.close()
+    produkty = execute_query("SELECT * FROM produkty ORDER BY id ASC", fetchall=True)
 
     rows_html = ""
-    for p in produkty:
-        rows_html += f"""
-        <tr>
-            <td>{p['id']}</td>
-            <td>{p['nazwa']}</td>
-            <td><code>{p['kod_kreskowy']}</code></td>
-            <td>{p['cena']:.2f} zł</td>
-            <td>{p['kategoria']}</td>
-            <td>
-                <a href="/admin/edytuj/{p['id']}" class="btn btn-blue">✏️ Edytuj</a>
-                <a href="/admin/usun/{p['id']}" class="btn btn-red" onclick="return confirm('Czy na pewno usunąć produkt?')">🗑️ Usuń</a>
-            </td>
-        </tr>
-        """
+    if produkty:
+        for p in produkty:
+            rows_html += f"""
+            <tr>
+                <td>{p['id']}</td>
+                <td>{p['nazwa']}</td>
+                <td><code>{p['kod_kreskowy']}</code></td>
+                <td>{p['cena']:.2f} zł</td>
+                <td>{p['kategoria']}</td>
+                <td>
+                    <a href="/admin/edytuj/{p['id']}" class="btn btn-blue">✏️ Edytuj</a>
+                    <a href="/admin/usun/{p['id']}" class="btn btn-red" onclick="return confirm('Czy na pewno usunąć produkt?')">🗑️ Usuń</a>
+                </td>
+            </tr>
+            """
 
     content = f"""
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
@@ -350,21 +496,20 @@ def admin_transakcje():
     if not session.get("admin"):
         return redirect(url_for("admin_login"))
 
-    conn = get_db_connection()
-    transakcje = conn.execute("SELECT * FROM transakcje ORDER BY id DESC").fetchall()
-    conn.close()
+    transakcje = execute_query("SELECT * FROM transakcje ORDER BY id DESC", fetchall=True)
 
     rows_html = ""
-    for t in transakcje:
-        rows_html += f"""
-        <tr>
-            <td>#{t['id']}</td>
-            <td>{t['data_czas']}</td>
-            <td><b>{t['suma']:.2f} zł</b></td>
-            <td>{t['metoda_platnosci']}</td>
-            <td><a href="/admin/transakcja/{t['id']}" class="btn btn-blue">🔍 Szczegóły</a></td>
-        </tr>
-        """
+    if transakcje:
+        for t in transakcje:
+            rows_html += f"""
+            <tr>
+                <td>#{t['id']}</td>
+                <td>{t['data_czas']}</td>
+                <td><b>{t['suma']:.2f} zł</b></td>
+                <td>{t['metoda_platnosci']}</td>
+                <td><a href="/admin/transakcja/{t['id']}" class="btn btn-blue">🔍 Szczegóły</a></td>
+            </tr>
+            """
 
     content = f"""
         <h2>📜 Historia Transakcji</h2>
@@ -391,24 +536,23 @@ def admin_transakcja_szczegoly(id):
     if not session.get("admin"):
         return redirect(url_for("admin_login"))
 
-    conn = get_db_connection()
-    transakcja = conn.execute("SELECT * FROM transakcje WHERE id = ?", (id,)).fetchone()
-    pozycje = conn.execute("SELECT * FROM transakcje_pozycje WHERE transakcja_id = ?", (id,)).fetchall()
-    conn.close()
+    transakcja = execute_query("SELECT * FROM transakcje WHERE id = ?", (id,), fetchone=True)
+    pozycje = execute_query("SELECT * FROM transakcje_pozycje WHERE transakcja_id = ?", (id,), fetchall=True)
 
     if not transakcja:
         return redirect(url_for("admin_transakcje"))
 
     pozycje_html = ""
-    for p in pozycje:
-        pozycje_html += f"""
-        <tr>
-            <td>{p['nazwa_produktu']}</td>
-            <td>{p['cena_jednostkowa']:.2f} zł</td>
-            <td>{p['ilosc']}</td>
-            <td>{p['wartosc']:.2f} zł</td>
-        </tr>
-        """
+    if pozycje:
+        for p in pozycje:
+            pozycje_html += f"""
+            <tr>
+                <td>{p['nazwa_produktu']}</td>
+                <td>{p['cena_jednostkowa']:.2f} zł</td>
+                <td>{p['ilosc']}</td>
+                <td>{p['wartosc']:.2f} zł</td>
+            </tr>
+            """
 
     content = f"""
         <h2>🔍 Szczegóły Transakcji #{transakcja['id']}</h2>
@@ -450,18 +594,14 @@ def admin_dodaj():
             if not nazwa or not kod_kreskowy:
                 error = "❌ Wypełnij wszystkie pola!"
             else:
-                conn = get_db_connection()
-                conn.execute(
+                execute_query(
                     "INSERT INTO produkty (nazwa, kod_kreskowy, cena, kategoria) VALUES (?, ?, ?, ?)",
-                    (nazwa, kod_kreskowy, cena, kategoria)
+                    (nazwa, kod_kreskowy, cena, kategoria),
+                    commit=True
                 )
-                conn.commit()
-                conn.close()
                 return redirect(url_for("admin_panel"))
-        except sqlite3.IntegrityError:
-            error = f"❌ Produkt z kodem '{kod_kreskowy}' już istnieje!"
-        except ValueError:
-            error = "❌ Niepoprawna cena!"
+        except Exception as e:
+            error = f"❌ Błąd podczas dodawania produktu lub kod już istnieje!"
 
     content = f"""
         <h2>➕ Dodaj Nowy Produkt</h2>
@@ -500,11 +640,9 @@ def admin_edytuj(id):
     if not session.get("admin"):
         return redirect(url_for("admin_login"))
 
-    conn = get_db_connection()
-    prod = conn.execute("SELECT * FROM produkty WHERE id = ?", (id,)).fetchone()
+    prod = execute_query("SELECT * FROM produkty WHERE id = ?", (id,), fetchone=True)
 
     if not prod:
-        conn.close()
         return redirect(url_for("admin_panel"))
 
     error = ""
@@ -516,19 +654,14 @@ def admin_edytuj(id):
 
         try:
             cena = float(cena_str)
-            conn.execute(
+            execute_query(
                 "UPDATE produkty SET nazwa = ?, kod_kreskowy = ?, cena = ?, kategoria = ? WHERE id = ?",
-                (nazwa, kod_kreskowy, cena, kategoria, id)
+                (nazwa, kod_kreskowy, cena, kategoria, id),
+                commit=True
             )
-            conn.commit()
-            conn.close()
             return redirect(url_for("admin_panel"))
-        except sqlite3.IntegrityError:
-            error = f"❌ Kod kreskowy '{kod_kreskowy}' jest używany przez inny produkt!"
-        except ValueError:
-            error = "❌ Niepoprawna cena!"
-
-    conn.close()
+        except Exception:
+            error = "❌ Błąd edycji! Sprawdź poprawność danych."
 
     content = f"""
         <h2>✏️ Edytuj Produkt #{prod['id']}</h2>
@@ -567,11 +700,7 @@ def admin_usun(id):
     if not session.get("admin"):
         return redirect(url_for("admin_login"))
 
-    conn = get_db_connection()
-    conn.execute("DELETE FROM produkty WHERE id = ?", (id,))
-    conn.commit()
-    conn.close()
-
+    execute_query("DELETE FROM produkty WHERE id = ?", (id,), commit=True)
     return redirect(url_for("admin_panel"))
 
 
@@ -584,20 +713,19 @@ def platnosc_sukces():
     if not t_data:
         return redirect(url_for("home"))
 
-    conn = get_db_connection()
-    transakcja = conn.execute("SELECT * FROM transakcje WHERE id = ?", (t_data["id"],)).fetchone()
-    pozycje = conn.execute("SELECT * FROM transakcje_pozycje WHERE transakcja_id = ?", (t_data["id"],)).fetchall()
-    conn.close()
+    transakcja = execute_query("SELECT * FROM transakcje WHERE id = ?", (t_data["id"],), fetchone=True)
+    pozycje = execute_query("SELECT * FROM transakcje_pozycje WHERE transakcja_id = ?", (t_data["id"],), fetchall=True)
 
     pozycje_html = ""
-    for p in pozycje:
-        pozycje_html += f"""
-        <tr>
-            <td style="padding: 4px 0;">{p['nazwa_produktu']}</td>
-            <td style="padding: 4px 0; text-align: center;">{p['ilosc']}</td>
-            <td style="padding: 4px 0; text-align: right;">{p['wartosc']:.2f}</td>
-        </tr>
-        """
+    if pozycje:
+        for p in pozycje:
+            pozycje_html += f"""
+            <tr>
+                <td style="padding: 4px 0;">{p['nazwa_produktu']}</td>
+                <td style="padding: 4px 0; text-align: center;">{p['ilosc']}</td>
+                <td style="padding: 4px 0; text-align: right;">{p['wartosc']:.2f}</td>
+            </tr>
+            """
 
     content = f"""
         <div style="text-align: center; margin-bottom: 20px;">
@@ -656,7 +784,8 @@ def platnosc_sukces():
 
 
 # ----------------------------------------------------
-# START APLIKACJI
+# START APLIKACJI (RENDER / LOCAL)
 # ----------------------------------------------------
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
