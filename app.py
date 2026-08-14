@@ -25,7 +25,7 @@ def execute_query(query, params=(), fetchone=False, fetchall=False, commit=False
     conn = get_db_connection()
     is_postgres = DATABASE_URL is not None
     
-    # Zamiana składni SQL ze stylu SQLite (?) na Postgres ($1, $2 lub %s)
+    # Zamiana składni SQL ze stylu SQLite (?) na Postgres (%s)
     if is_postgres:
         query = query.replace("?", "%s")
 
@@ -97,10 +97,13 @@ def init_db():
         )
     """)
 
-    # Inicjalizacja domyślnego hasła admina
-    cursor.execute("SELECT wartosc FROM ustawienia WHERE klucz = 'admin_password'" if not is_postgres else "SELECT wartosc FROM ustawienia WHERE klucz = %s", ('admin_password',))
+    # Inicjalizacja domyślnego hasła admina (Poprawione zapytanie)
+    sql_check_pass = "SELECT wartosc FROM ustawienia WHERE klucz = %s" if is_postgres else "SELECT wartosc FROM ustawienia WHERE klucz = ?"
+    cursor.execute(sql_check_pass, ('admin_password',))
+    
     if not cursor.fetchone():
-        cursor.execute("INSERT INTO ustawienia (klucz, wartosc) VALUES (%s, %s)" if is_postgres else "INSERT INTO ustawienia (klucz, wartosc) VALUES (?, ?)", ('admin_password', '13990'))
+        sql_insert_pass = "INSERT INTO ustawienia (klucz, wartosc) VALUES (%s, %s)" if is_postgres else "INSERT INTO ustawienia (klucz, wartosc) VALUES (?, ?)"
+        cursor.execute(sql_insert_pass, ('admin_password', '13990'))
 
     # Przykładowe dane początkowe
     cursor.execute("SELECT COUNT(*) FROM produkty")
@@ -115,8 +118,9 @@ def init_db():
             ("Kawa Mielona 500g", "5901111222333", 24.99, "Artykuły spożywcze"),
             ("Czekolada Mleczna", "5907777888999", 5.49, "Słodycze")
         ]
+        sql_insert_prod = "INSERT INTO produkty (nazwa, kod_kreskowy, cena, kategoria) VALUES (%s, %s, %s, %s)" if is_postgres else "INSERT INTO produkty (nazwa, kod_kreskowy, cena, kategoria) VALUES (?, ?, ?, ?)"
         for p in przykładowe_produkty:
-            cursor.execute("INSERT INTO produkty (nazwa, kod_kreskowy, cena, kategoria) VALUES (%s, %s, %s, %s)" if is_postgres else "INSERT INTO produkty (nazwa, kod_kreskowy, cena, kategoria) VALUES (?, ?, ?, ?)", p)
+            cursor.execute(sql_insert_prod, p)
 
     conn.commit()
     cursor.close()
@@ -179,7 +183,6 @@ HTML_LAYOUT = """
 </body>
 </html>
 """
-
 
 # ----------------------------------------------------
 # KASA / OBSŁUGA KOSZYKA
@@ -275,7 +278,6 @@ def home():
     """
     return render_template_string(HTML_LAYOUT, content=content)
 
-
 @app.route("/dodaj_do_koszyka", methods=["POST"])
 def dodaj_do_koszyka():
     kod = request.form.get("kod_kreskowy", "").strip()
@@ -302,7 +304,6 @@ def dodaj_do_koszyka():
         session["koszyk"] = koszyk
     return redirect(url_for("home"))
 
-
 @app.route("/usun_z_koszyka/<int:index>")
 def usun_z_koszyka(index):
     koszyk = session.get("koszyk", [])
@@ -311,12 +312,10 @@ def usun_z_koszyka(index):
         session["koszyk"] = koszyk
     return redirect(url_for("home"))
 
-
 @app.route("/czysc_koszyk")
 def czysc_koszyk():
     session["koszyk"] = []
     return redirect(url_for("home"))
-
 
 @app.route("/platnosc", methods=["POST"])
 def platnosc():
@@ -359,7 +358,6 @@ def platnosc():
 
     return redirect(url_for("platnosc_sukces"))
 
-
 # ----------------------------------------------------
 # PANEL ADMINISTRATORA & ZMIANA HASŁA
 # ----------------------------------------------------
@@ -388,7 +386,6 @@ def admin_login():
         </div>
     """
     return render_template_string(HTML_LAYOUT, content=content)
-
 
 @app.route("/admin/zmien-haslo", methods=["GET", "POST"])
 def admin_zmien_haslo():
@@ -436,12 +433,10 @@ def admin_zmien_haslo():
     """
     return render_template_string(HTML_LAYOUT, content=content)
 
-
 @app.route("/admin/logout")
 def admin_logout():
     session.pop("admin", None)
     return redirect(url_for("home"))
-
 
 @app.route("/admin")
 def admin_panel():
@@ -490,7 +485,6 @@ def admin_panel():
     """
     return render_template_string(HTML_LAYOUT, content=content)
 
-
 @app.route("/admin/transakcje")
 def admin_transakcje():
     if not session.get("admin"):
@@ -529,7 +523,6 @@ def admin_transakcje():
         </table>
     """
     return render_template_string(HTML_LAYOUT, content=content)
-
 
 @app.route("/admin/transakcja/<int:id>")
 def admin_transakcja_szczegoly(id):
@@ -576,7 +569,6 @@ def admin_transakcja_szczegoly(id):
     """
     return render_template_string(HTML_LAYOUT, content=content)
 
-
 @app.route("/admin/dodaj", methods=["GET", "POST"])
 def admin_dodaj():
     if not session.get("admin"):
@@ -600,8 +592,8 @@ def admin_dodaj():
                     commit=True
                 )
                 return redirect(url_for("admin_panel"))
-        except Exception as e:
-            error = f"❌ Błąd podczas dodawania produktu lub kod już istnieje!"
+        except Exception:
+            error = "❌ Błąd podczas dodawania produktu lub kod już istnieje!"
 
     content = f"""
         <h2>➕ Dodaj Nowy Produkt</h2>
@@ -633,7 +625,6 @@ def admin_dodaj():
         </form>
     """
     return render_template_string(HTML_LAYOUT, content=content)
-
 
 @app.route("/admin/edytuj/<int:id>", methods=["GET", "POST"])
 def admin_edytuj(id):
@@ -694,7 +685,6 @@ def admin_edytuj(id):
     """
     return render_template_string(HTML_LAYOUT, content=content)
 
-
 @app.route("/admin/usun/<int:id>")
 def admin_usun(id):
     if not session.get("admin"):
@@ -702,7 +692,6 @@ def admin_usun(id):
 
     execute_query("DELETE FROM produkty WHERE id = ?", (id,), commit=True)
     return redirect(url_for("admin_panel"))
-
 
 # ----------------------------------------------------
 # PODSUMOWANIE TRANSAKCJI / PARAGON
@@ -733,7 +722,6 @@ def platnosc_sukces():
             <p>Dziękujemy za zakupy.</p>
         </div>
 
-        <!-- WIZUALIZACJA PARAGONU -->
         <div id="paragon" style="max-width: 320px; margin: 0 auto; background: #fff8e7; padding: 20px; border: 1px dashed #aaa; font-family: 'Courier New', Courier, monospace; color: #000; box-shadow: 0 4px 10px rgba(0,0,0,0.05);">
             <div style="text-align: center; border-bottom: 1px dashed #000; padding-bottom: 10px; margin-bottom: 10px;">
                 <h3 style="margin: 0; font-size: 1.2em;">SKLEP MONOPOLOWO-SPOŻYWCZY</h3>
@@ -782,10 +770,6 @@ def platnosc_sukces():
     """
     return render_template_string(HTML_LAYOUT, content=content)
 
-
-# ----------------------------------------------------
-# START APLIKACJI (RENDER / LOCAL)
-# ----------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
