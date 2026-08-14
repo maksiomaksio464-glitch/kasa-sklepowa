@@ -6,6 +6,7 @@ from flask import Flask, render_template_string, request, redirect, url_for, ses
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "super_tajny_kluczyk_systemu_pos")
+print(os.getcwd())
 
 # Konfiguracja Połączenia z Bazą Danych (Supabase / PostgreSQL lub fallback do SQLite)
 DATABASE_URL = os.environ.get("DATABASE_URL")
