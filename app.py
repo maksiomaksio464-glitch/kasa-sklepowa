@@ -1,16 +1,23 @@
-from flask import Flask, render_template_string, request, redirect, url_for, session
 import sqlite3
-from datetime import datetime
+from flask import Flask, render_template_string, request, redirect, url_for, session
 
 app = Flask(__name__)
-app.secret_key = "super_tajny_klucz_kasy"
+app.secret_key = "super_tajny_kluczyk_systemu_pos"
 
-# ----------------------------------------------------
-# BAZA DANYCH (SQLite)
-# ----------------------------------------------------
+# Ustawienie hasła administratora
+ADMIN_PASSWORD = "13990"
+
+
+def get_db_connection():
+    conn = sqlite3.connect("sklep.db")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def init_db():
-    conn = sqlite3.connect("kasa.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
+
     # Tabela produktów
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS produkty (
@@ -21,603 +28,273 @@ def init_db():
             kategoria TEXT NOT NULL
         )
     """)
-    # Tabela nagłówków transakcji
+
+    # Tabela transakcji
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS transakcje (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            data_czas TEXT NOT NULL,
+            data_czas DATETIME DEFAULT CURRENT_TIMESTAMP,
             suma REAL NOT NULL,
             metoda_platnosci TEXT NOT NULL,
-            wplacono REAL,
-            reszta REAL
+            wplacono REAL DEFAULT 0,
+            reszta REAL DEFAULT 0
         )
     """)
-    # Tabela pozycji w transakcjach
+
+    # Tabela pozycji transakcji
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS transakcje_pozycje (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             transakcja_id INTEGER NOT NULL,
             nazwa_produktu TEXT NOT NULL,
-            cena_jedn REAL NOT NULL,
-            ilosc REAL NOT NULL,
+            cena_jednostkowa REAL NOT NULL,
+            ilosc INTEGER NOT NULL,
             wartosc REAL NOT NULL,
-            FOREIGN KEY(transakcja_id) REFERENCES transakcje(id)
+            FOREIGN KEY (transakcja_id) REFERENCES transakcje(id)
         )
     """)
+
+    # Przykładowe dane początkowe
+    cursor.execute("SELECT COUNT(*) FROM produkty")
+    if cursor.fetchone()[0] == 0:
+        przykładowe_produkty = [
+            ("Mleko 3.2%", "5901234567890", 3.99, "Nabiał"),
+            ("Chleb Wiejski", "5909876543210", 4.50, "Pieczywo"),
+            ("Woda Mineralna 1.5L", "5905555444333", 2.20, "Napoje"),
+            ("Kawa Mielona 500g", "5901111222333", 24.99, "Artykuły spożywcze"),
+            ("Czekolada Mleczna", "5907777888999", 5.49, "Słodycze")
+        ]
+        cursor.executemany(
+            "INSERT INTO produkty (nazwa, kod_kreskowy, cena, kategoria) VALUES (?, ?, ?, ?)",
+            przykładowe_produkty
+        )
+
     conn.commit()
     conn.close()
 
+
 init_db()
 
-def get_db_connection():
-    conn = sqlite3.connect("kasa.db")
-    conn.row_factory = sqlite3.Row
-    return conn
-
-# ----------------------------------------------------
-# SZABLON HTML
-# ----------------------------------------------------
+# Main HTML Layout Template
 HTML_LAYOUT = """
 <!DOCTYPE html>
 <html lang="pl">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Kasa Sklepowa</title>
-    <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+    <title>System POS - Sklep Monopolowo-Spożywczy</title>
     <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #eef2f5; margin: 0; padding: 15px; }
-        .container { max-width: 1000px; margin: auto; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
-        h1, h2, h3 { color: #1a252f; margin-top: 0; }
-        .btn { padding: 10px 15px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-block; font-size: 15px; text-align: center; }
-        .btn-green { background: #2ecc71; color: white; }
-        .btn-red { background: #e74c3c; color: white; }
-        .btn-blue { background: #3498db; color: white; }
-        .btn-orange { background: #e67e22; color: white; }
-        .btn-gray { background: #95a5a6; color: white; }
-        
-        form { margin-bottom: 20px; }
-        input, select { padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 16px; }
-        .input-group { display: flex; gap: 10px; flex-wrap: wrap; }
-        .input-group input { flex: 1; min-width: 150px; }
-
-        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
-        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
-        th { background: #f8f9fa; }
-
-        .header-nav { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #eee; padding-bottom: 15px; margin-bottom: 20px; }
-        .summary { background: #2c3e50; color: white; padding: 18px; border-radius: 8px; text-align: right; margin-top: 20px; font-size: 1.3em; }
-        .summary span { color: #2ecc71; font-weight: bold; font-size: 1.3em; }
-        
-        .alert { padding: 10px; border-radius: 6px; margin-bottom: 15px; font-weight: bold; }
-        .alert-error { background: #f8d7da; color: #721c24; }
-        .alert-success { background: #d4edda; color: #155724; }
-
-        .qty-input { width: 60px; text-align: center; padding: 5px; font-weight: bold; }
-
-        #reader { width: 100%; max-width: 500px; margin: 15px auto; border-radius: 8px; overflow: hidden; display: none; }
-        .scanner-box { text-align: center; background: #f8f9fa; border: 2px dashed #b2bec3; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
-
-        .search-results { background: #fff; border: 1px solid #ddd; border-radius: 6px; margin-top: 5px; max-height: 200px; overflow-y: auto; }
-        .search-item { padding: 10px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
-        .search-item:hover { background: #f1f2f6; }
-
-        .payment-box { background: #f8f9fa; border: 1px solid #ddd; padding: 20px; border-radius: 8px; margin-top: 20px; }
-        .payment-methods { display: flex; gap: 15px; margin: 15px 0; }
-        .payment-methods label { flex: 1; background: white; border: 2px solid #ccc; padding: 15px; border-radius: 8px; text-align: center; cursor: pointer; font-weight: bold; font-size: 18px; }
-        .payment-methods input[type="radio"] { display: none; }
-        .payment-methods label.active { border-color: #2ecc71; background: #e8f8f5; }
-
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }
-        .stat-card { background: #f8f9fa; border: 1px solid #ddd; padding: 15px; border-radius: 8px; text-align: center; }
-        .stat-card h4 { margin: 0; color: #7f8c8d; font-size: 0.9em; }
-        .stat-card p { margin: 5px 0 0 0; font-size: 1.5em; font-weight: bold; color: #2c3e50; }
+        * { box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        body { margin: 0; padding: 0; background-color: #f4f6f9; color: #333; }
+        header { background-color: #2c3e50; color: white; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; }
+        header h1 { margin: 0; font-size: 1.5em; }
+        nav a { color: white; text-decoration: none; margin-left: 15px; padding: 8px 12px; border-radius: 4px; background: rgba(255,255,255,0.1); }
+        nav a:hover { background: rgba(255,255,255,0.2); }
+        .container { padding: 30px; max-width: 1200px; margin: 0 auto; }
+        .btn { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; text-decoration: none; display: inline-block; font-size: 0.9em; font-weight: bold; }
+        .btn-green { background-color: #2ecc71; color: white; }
+        .btn-blue { background-color: #3498db; color: white; }
+        .btn-red { background-color: #e74c3c; color: white; }
+        .btn-gray { background-color: #95a5a6; color: white; }
+        .alert { padding: 12px; margin-bottom: 20px; border-radius: 4px; }
+        .alert-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .alert-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        table { width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 5px rgba(0,0,0,0.05); margin-bottom: 20px; }
+        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background-color: #f8f9fa; }
+        input[type="text"], input[type="number"], input[type="password"] { padding: 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 1em; }
     </style>
 </head>
 <body>
+    <header>
+        <h1>🛒 Kasa Fiskalna / POS</h1>
+        <nav>
+            <a href="/">🛒 Kasa</a>
+            {% if session.get('admin') %}
+                <a href="/admin">⚙️ Panel Admina</a>
+                <a href="/admin/transakcje">📜 Transakcje</a>
+                <a href="/admin/logout">🚪 Wyloguj</a>
+            {% else %}
+                <a href="/admin/login">🔒 Logowanie Admin</a>
+            {% endif %}
+        </nav>
+    </header>
     <div class="container">
-        {{ content | safe }}
+        {{ content|safe }}
     </div>
 </body>
 </html>
 """
 
-# ----------------------------------------------------
-# TRASY APLIKACJI - EKRAN GŁÓWNY
-# ----------------------------------------------------
 
+# ----------------------------------------------------
+# KASA / OBSŁUGA KOSZYKA
+# ----------------------------------------------------
 @app.route("/")
 def home():
-    koszyk = session.get("koszyk", {})
-    szukaj_q = request.args.get("q", "").strip()
-    
-    produkty_w_koszyku = []
-    suma_total = 0.0
+    if "koszyk" not in session:
+        session["koszyk"] = []
 
-    if koszyk:
-        conn = get_db_connection()
-        for kod, ilosc in koszyk.items():
-            prod = conn.execute("SELECT * FROM produkty WHERE kod_kreskowy = ?", (kod,)).fetchone()
-            if prod:
-                wartosc = prod["cena"] * ilosc
-                suma_total += wartosc
-                produkty_w_koszyku.append({
-                    "id": prod["id"],
-                    "nazwa": prod["nazwa"],
-                    "kod_kreskowy": prod["kod_kreskowy"],
-                    "cena": prod["cena"],
-                    "kategoria": prod["kategoria"],
-                    "ilosc": ilosc,
-                    "wartosc": wartosc
-                })
-        conn.close()
+    koszyk = session["koszyk"]
+    suma = sum(item["cena"] * item["ilosc"] for item in koszyk)
 
-    wyniki_szukania = []
-    if szukaj_q:
-        conn = get_db_connection()
-        wyniki_szukania = conn.execute(
-            "SELECT * FROM produkty WHERE nazwa LIKE ? OR kod_kreskowy LIKE ?", 
-            (f"%{szukaj_q}%", f"%{szukaj_q}%")
-        ).fetchall()
-        conn.close()
+    conn = get_db_connection()
+    produkty = conn.execute("SELECT * FROM produkty").fetchall()
+    conn.close()
 
-    rows = ""
-    for item in produkty_w_koszyku:
-        rows += f"""
+    pozycje_html = ""
+    for i, item in enumerate(koszyk):
+        pozycje_html += f"""
         <tr>
-            <td><b>{item['nazwa']}</b><br><small style="color: #7f8c8d;">{item['kategoria']}</small></td>
-            <td><code>{item['kod_kreskowy']}</code></td>
+            <td>{item['nazwa']}</td>
             <td>{item['cena']:.2f} zł</td>
-            <td>
-                <form action="/koszyk/zmien_ilosc" method="POST" style="display: inline; margin: 0;">
-                    <input type="hidden" name="kod" value="{item['kod_kreskowy']}">
-                    <input type="number" step="0.001" name="ilosc" value="{item['ilosc']}" class="qty-input" onchange="this.form.submit()">
-                </form>
-            </td>
-            <td><b>{item['wartosc']:.2f} zł</b></td>
-            <td>
-                <a href="/koszyk/usun/{item['kod_kreskowy']}" class="btn btn-red" style="padding: 4px 8px; font-size: 13px;">✕</a>
-            </td>
+            <td>{item['ilosc']}</td>
+            <td>{item['cena'] * item['ilosc']:.2f} zł</td>
+            <td><a href="/usun_z_koszyka/{i}" class="btn btn-red">❌ Usunąć</a></td>
         </tr>
         """
 
-    search_html = ""
-    if szukaj_q:
-        search_html += f"<h4>🔎 Wyniki wyszukiwania dla: '{szukaj_q}'</h4><div class='search-results'>"
-        if wyniki_szukania:
-            for p in wyniki_szukania:
-                search_html += f"""
-                <div class='search-item'>
-                    <div><b>{p['nazwa']}</b> ({p['cena']:.2f} zł) - <code>{p['kod_kreskowy']}</code></div>
-                    <form action='/koszyk/dodaj' method='POST' style='margin: 0;'>
-                        <input type='hidden' name='kod_kreskowy' value='{p['kod_kreskowy']}'>
-                        <button type='submit' class='btn btn-green' style='padding: 5px 10px;'>+ Dodaj</button>
-                    </form>
-                </div>
-                """
-        else:
-            search_html += "<div class='search-item' style='color: #7f8c8d;'>Brak wyników.</div>"
-        search_html += "</div><br>"
+    produkty_options = ""
+    for p in produkty:
+        produkty_options += f'<option value="{p["kod_kreskowy"]}">{p["nazwa"]} - {p["cena"]:.2f} zł (Kod: {p["kod_kreskowy"]})</option>'
 
-    msg = session.pop("msg", None)
-    msg_type = session.pop("msg_type", "error")
-    alert_html = f'<div class="alert alert-{msg_type}">{msg}</div>' if msg else ""
-
-    content = f"""
-        <div class="header-nav">
-            <h1>🛒 Kasa Sklepowa</h1>
-            <div>
-                <a href="/admin" class="btn btn-blue">⚙️ Admin</a>
-            </div>
-        </div>
-
-        {alert_html}
-
-        <div class="scanner-box">
-            <h3>📷 Skaner Kodów Kreskowych</h3>
-            <button id="start-scan-btn" class="btn btn-blue" onclick="startScanner()">📷 Włącz aparat</button>
-            <button id="stop-scan-btn" class="btn btn-red" onclick="stopScanner()" style="display: none;">⏹️ Wyłącz aparat</button>
-            <div id="reader"></div>
-        </div>
-
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
-            <form id="barcode-form" action="/koszyk/dodaj" method="POST">
-                <h3>🔍 Wpisz kod kreskowy:</h3>
-                <div class="input-group">
-                    <input type="text" id="kod_kreskowy_input" name="kod_kreskowy" placeholder="Kod kreskowy..." required>
-                    <button type="submit" class="btn btn-green">➕ Dodaj</button>
-                </div>
-            </form>
-
-            <form action="/" method="GET">
-                <h3>🔎 Szukaj po nazwie:</h3>
-                <div class="input-group">
-                    <input type="text" name="q" value="{szukaj_q}" placeholder="np. Chleb, Jabłka...">
-                    <button type="submit" class="btn btn-blue">Szukaj</button>
-                </div>
-            </form>
-        </div>
-
-        {search_html}
-
-        <h3>📋 Koszyk:</h3>
-        <table>
-            <thead>
-                <tr>
-                    <th>Produkt</th>
-                    <th>Kod</th>
-                    <th>Cena</th>
-                    <th>Ilość / Waga</th>
-                    <th>Wartość</th>
-                    <th></th>
-                </tr>
-            </thead>
-            <tbody>
-                {rows if rows else '<tr><td colspan="6" style="text-align: center; color: #7f8c8d;">Koszyk jest pusty. Zeskanuj lub dodaj produkt!</td></tr>'}
-            </tbody>
-        </table>
-
-        <div class="summary">
-            Suma do zapłaty: <span>{suma_total:.2f} zł</span>
-        </div>
-
-        <div style="margin-top: 15px; display: flex; justify-content: space-between;">
-            <a href="/koszyk/wyczysc" class="btn btn-red" onclick="return confirm('Wyczyścić cały koszyk?')">🗑️ Wyczyść</a>
-            <a href="/platnosc" class="btn btn-green" style="font-size: 18px; padding: 12px 25px; {'pointer-events: none; opacity: 0.5;' if not koszyk else ''}">💵 Przejdź do Płatności</a>
-        </div>
-
-        <script>
-            let html5QrcodeScanner = null;
-
-            function startScanner() {{
-                document.getElementById('reader').style.display = 'block';
-                document.getElementById('start-scan-btn').style.display = 'none';
-                document.getElementById('stop-scan-btn').style.display = 'inline-block';
-
-                html5QrcodeScanner = new Html5Qrcode("reader");
-                const config = {{ fps: 10, qrbox: {{ width: 250, height: 150 }} }};
-
-                html5QrcodeScanner.start(
-                    {{ facingMode: "environment" }},
-                    config,
-                    onScanSuccess
-                ).catch(err => {{
-                    alert("Błąd aparatu: " + err);
-                    stopScanner();
-                }});
-            }}
-
-            function stopScanner() {{
-                if (html5QrcodeScanner) {{
-                    html5QrcodeScanner.stop().then(() => {{
-                        document.getElementById('reader').style.display = 'none';
-                        document.getElementById('start-scan-btn').style.display = 'inline-block';
-                        document.getElementById('stop-scan-btn').style.display = 'none';
-                    }}).catch(err => console.log(err));
-                }}
-            }}
-
-            function onScanSuccess(decodedText) {{
-                let audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-                let osc = audioCtx.createOscillator();
-                osc.connect(audioCtx.destination);
-                osc.frequency.value = 800;
-                osc.start();
-                osc.stop(audioCtx.currentTime + 0.15);
-
-                document.getElementById('kod_kreskowy_input').value = decodedText;
-                stopScanner();
-                document.getElementById('barcode-form').submit();
-            }}
-        </script>
-    """
-    return render_template_string(HTML_LAYOUT, content=content)
-
-
-# ----------------------------------------------------
-# EKRAN PŁATNOŚCI I SYMULACJA TERMINALA POS
-# ----------------------------------------------------
-@app.route("/platnosc", methods=["GET", "POST"])
-def platnosc():
-    koszyk = session.get("koszyk", {})
-    if not koszyk:
-        return redirect(url_for("home"))
-
-    conn = get_db_connection()
-    produkty_w_koszyku = []
-    suma_total = 0.0
-
-    for kod, ilosc in koszyk.items():
-        prod = conn.execute("SELECT * FROM produkty WHERE kod_kreskowy = ?", (kod,)).fetchone()
-        if prod:
-            wartosc = prod["cena"] * ilosc
-            suma_total += wartosc
-            produkty_w_koszyku.append({
-                "nazwa": prod["nazwa"],
-                "cena": prod["cena"],
-                "ilosc": ilosc,
-                "wartosc": wartosc
-            })
-
-    error = ""
-    if request.method == "POST":
-        metoda = request.form.get("metoda")
-        wplacono_str = request.form.get("wplacono", "0").replace(",", ".")
-        wplacono = float(wplacono_str) if wplacono_str else 0.0
-
-        if metoda == "Gotówka" and wplacono < suma_total:
-            error = f"❌ Podano za małą kwotę! Brakuje: {(suma_total - wplacono):.2f} zł"
-        elif metoda in ["Karta", "BLIK"]:
-            # Jeśli wybrano kartę/BLIK -> przekierowujemy na ekran terminala
-            session["oczekujaca_transakcja"] = {
-                "suma": suma_total,
-                "metoda": metoda,
-                "produkty": produkty_w_koszyku
-            }
-            conn.close()
-            return redirect(url_for("platnosc_terminal"))
-        else:
-            # Gotówka - zapisujemy od razu
-            reszta = wplacono - suma_total
-            data_czas = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO transakcje (data_czas, suma, metoda_platnosci, wplacono, reszta) VALUES (?, ?, ?, ?, ?)",
-                (data_czas, suma_total, metoda, wplacono, reszta)
-            )
-            transakcja_id = cursor.lastrowid
-
-            for item in produkty_w_koszyku:
-                cursor.execute(
-                    "INSERT INTO transakcje_pozycje (transakcja_id, nazwa_produktu, cena_jedn, ilosc, wartosc) VALUES (?, ?, ?, ?, ?)",
-                    (transakcja_id, item["nazwa"], item["cena"], item["ilosc"], item["wartosc"])
-                )
-
-            conn.commit()
-            conn.close()
-
-            session.pop("koszyk", None)
-            session["ostatnia_transakcja"] = {
-                "id": transakcja_id,
-                "suma": suma_total,
-                "metoda": metoda,
-                "wplacono": wplacono,
-                "reszta": reszta
-            }
-            return redirect(url_for("platnosc_sukces"))
-
-    conn.close()
-
-    content = f"""
-        <h2>💵 Ekran Płatności</h2>
-        {f'<div class="alert alert-error">{error}</div>' if error else ''}
-
-        <div class="summary" style="text-align: center; font-size: 1.8em; margin-bottom: 20px;">
-            Do zapłaty: <span>{suma_total:.2f} zł</span>
-        </div>
-
-        <form method="POST">
-            <h3>1. Wybierz metodę płatności:</h3>
-            <div class="payment-methods">
-                <label id="lbl-gotowka" class="active">
-                    <input type="radio" name="metoda" value="Gotówka" checked onclick="toggleGotowka(true)">
-                    💵 Gotówka
-                </label>
-                <label id="lbl-karta">
-                    <input type="radio" name="metoda" value="Karta" onclick="toggleGotowka(false)">
-                    💳 Karta
-                </label>
-                <label id="lbl-blik">
-                    <input type="radio" name="metoda" value="BLIK" onclick="toggleGotowka(false)">
-                    📱 BLIK
-                </label>
-            </div>
-
-            <div id="box-gotowka" class="payment-box">
-                <h3>2. Podaj kwotę od klienta:</h3>
-                <div class="input-group">
-                    <input type="number" step="0.01" id="wplacono" name="wplacono" placeholder="np. 50" oninput="obliczReszte({suma_total:.2f})">
-                </div>
-                <h3 style="margin-top: 15px;">Reszta do wydania: <span id="reszta-val" style="color: #e74c3c;">0.00 zł</span></h3>
-            </div>
-
-            <div style="margin-top: 25px; display: flex; justify-content: space-between;">
-                <a href="/" class="btn btn-gray">← Powrót do kasy</a>
-                <button type="submit" class="btn btn-green" style="font-size: 18px; padding: 12px 30px;">✅ Przejdź dalej</button>
-            </div>
+    # Obsługa widoczności formularza płatności bezpośrednio w Pythonie
+    formularz_platnosci = ""
+    if koszyk:
+        formularz_platnosci = """
+        <form action="/platnosc" method="POST" style="display: flex; flex-direction: column; gap: 15px; margin-top: 20px;">
+            <label>
+                <b>Metoda Płatności:</b><br>
+                <select name="metoda" style="width: 100%; padding: 10px; margin-top: 5px; border-radius: 4px; border: 1px solid #ccc;">
+                    <option value="Karta">💳 Karta Płatnicza</option>
+                    <option value="Gotówka">💵 Gotówka</option>
+                    <option value="BLIK">📱 BLIK</option>
+                </select>
+            </label>
+            <label>
+                <b>Wpłacono (dla gotówki):</b><br>
+                <input type="number" step="0.01" name="wplacono" placeholder="0.00" style="width: 100%; margin-top: 5px;">
+            </label>
+            <button type="submit" class="btn btn-green" style="padding: 15px; font-size: 1.1em;">✅ Zrealizuj Płatność</button>
         </form>
-
-        <script>
-            function toggleGotowka(isGotowka) {{
-                document.getElementById('box-gotowka').style.display = isGotowka ? 'block' : 'none';
-                document.getElementById('lbl-gotowka').className = isGotowka ? 'active' : '';
-                document.getElementById('lbl-karta').className = !isGotowka ? '' : '';
-                document.getElementById('lbl-blik').className = !isGotowka ? '' : '';
-            }}
-
-            function obliczReszte(suma) {{
-                let wplacono = parseFloat(document.getElementById('wplacono').value) || 0;
-                let reszta = wplacono - suma;
-                let el = document.getElementById('reszta-val');
-
-                if (reszta >= 0) {{
-                    el.innerText = reszta.toFixed(2) + " zł";
-                    el.style.color = "#2ecc71";
-                }} else {{
-                    el.innerText = "Za mało o " + Math.abs(reszta).toFixed(2) + " zł";
-                    el.style.color = "#e74c3c";
-                }}
-            }}
-        </script>
-    """
-    return render_template_string(HTML_LAYOUT, content=content)
-
-
-@app.route("/platnosc/terminal", methods=["GET", "POST"])
-def platnosc_terminal():
-    t_data = session.get("oczekujaca_transakcja")
-    if not t_data:
-        return redirect(url_for("home"))
-
-    # Dokończenie transakcji po udanej autoryzacji w terminalu
-    if request.method == "POST":
-        conn = get_db_connection()
-        data_czas = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO transakcje (data_czas, suma, metoda_platnosci, wplacono, reszta) VALUES (?, ?, ?, ?, ?)",
-            (data_czas, t_data["suma"], t_data["metoda"], t_data["suma"], 0.0)
-        )
-        transakcja_id = cursor.lastrowid
-
-        for item in t_data["produkty"]:
-            cursor.execute(
-                "INSERT INTO transakcje_pozycje (transakcja_id, nazwa_produktu, cena_jedn, ilosc, wartosc) VALUES (?, ?, ?, ?, ?)",
-                (transakcja_id, item["nazwa"], item["cena"], item["ilosc"], item["wartosc"])
-            )
-
-        conn.commit()
-        conn.close()
-
-        session.pop("koszyk", None)
-        session.pop("oczekujaca_transakcja", None)
-        session["ostatnia_transakcja"] = {
-            "id": transakcja_id,
-            "suma": t_data["suma"],
-            "metoda": t_data["metoda"],
-            "wplacono": t_data["suma"],
-            "reszta": 0.0
-        }
-        return redirect(url_for("platnosc_sukces"))
+        """
 
     content = f"""
-        <div style="max-width: 450px; margin: 30px auto; background: #2c3e50; color: white; padding: 30px; border-radius: 15px; text-align: center; box-shadow: 0 10px 25px rgba(0,0,0,0.3); font-family: monospace;">
-            <h3 style="color: #bdc3c7; margin-bottom: 5px;">TERMINAL POS</h3>
-            <p style="font-size: 0.9em; color: #7f8c8d; margin-top: 0;">OCZEKIWANIE NA KARTĘ / BLIK</p>
-            <hr style="border-color: #34495e;">
+        <div style="display: flex; gap: 30px;">
+            <div style="flex: 2;">
+                <h2>🛒 Koszyk Transakcji</h2>
+                <form action="/dodaj_do_koszyka" method="POST" style="margin-bottom: 20px; display: flex; gap: 10px;">
+                    <input type="text" name="kod_kreskowy" placeholder="Skanuj lub wpisz kod..." style="flex: 1;" autofocus required>
+                    <button type="submit" class="btn btn-blue">➕ Dodaj</button>
+                </form>
 
-            <div style="font-size: 2.2em; font-weight: bold; margin: 25px 0; color: #2ecc71;">
-                {t_data['suma']:.2f} PLN
+                <form action="/dodaj_do_koszyka" method="POST" style="margin-bottom: 20px; display: flex; gap: 10px;">
+                    <select name="kod_kreskowy" style="flex: 1; padding: 10px; border-radius: 4px; border: 1px solid #ccc;">
+                        <option value="">-- Wybierz produkt z listy --</option>
+                        {produkty_options}
+                    </select>
+                    <button type="submit" class="btn btn-blue">➕ Dodaj wybrane</button>
+                </form>
+
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Produkt</th>
+                            <th>Cena</th>
+                            <th>Ilość</th>
+                            <th>Wartość</th>
+                            <th>Akcja</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {pozycje_html if koszyk else '<tr><td colspan="5" style="text-align:center;">Koszyk jest pusty.</td></tr>'}
+                    </tbody>
+                </table>
+                {f'<a href="/czysc_koszyk" class="btn btn-gray">🗑️ Wyczyść koszyk</a>' if koszyk else ''}
             </div>
 
-            <div id="terminal-status" style="background: #34495e; padding: 15px; border-radius: 8px; font-size: 1.1em; margin-bottom: 25px; min-height: 50px; display: flex; align-items: center; justify-content: center;">
-                📲 Proszę zbliżyć kartę lub podać BLIK...
-            </div>
-
-            <form id="finish-form" method="POST">
-                <button type="submit" id="confirm-btn" class="btn btn-green" style="width: 100%; display: none; font-size: 18px; padding: 12px;">✅ Dokończ</button>
-            </form>
-            <a href="/platnosc" class="btn btn-red" style="margin-top: 10px; width: 90%; font-size: 13px;"> Anuluj transakcję</a>
-        </div>
-
-        <script>
-            let statusEl = document.getElementById('terminal-status');
-            let formEl = document.getElementById('finish-form');
-
-            // Krok 1: Wykrycie karty po 2 sek
-            setTimeout(() => {{
-                statusEl.innerText = "⏳ Odczytywanie karty / autoryzacja...";
-                statusEl.style.color = "#f1c40f";
-            }}, 2000);
-
-            // Krok 2: Akceptacja po 4 sek
-            setTimeout(() => {{
-                statusEl.innerText = "✅ Transakcja Zaakceptowana!";
-                statusEl.style.color = "#2ecc71";
+            <div style="flex: 1; background: white; padding: 25px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); height: fit-content;">
+                <h2 style="margin-top:0;">Podsumowanie</h2>
+                <h1 style="color: #2ecc71; font-size: 2.5em; margin: 10px 0;">{suma:.2f} PLN</h1>
                 
-                // Automatyczne wysłanie formularza
-                setTimeout(() => {{
-                    formEl.submit();
-                }}, 1000);
-            }}, 4000);
-        </script>
+                {formularz_platnosci}
+            </div>
+        </div>
     """
     return render_template_string(HTML_LAYOUT, content=content)
 
-# ----------------------------------------------------
-# AKCJE KOSZYKA
-# ----------------------------------------------------
-@app.route("/koszyk/dodaj", methods=["POST"])
-def koszyk_dodaj():
+@app.route("/dodaj_do_koszyka", methods=["POST"])
+def dodaj_do_koszyka():
     kod = request.form.get("kod_kreskowy", "").strip()
-    
+    if not kod:
+        return redirect(url_for("home"))
+
     conn = get_db_connection()
     prod = conn.execute("SELECT * FROM produkty WHERE kod_kreskowy = ?", (kod,)).fetchone()
     conn.close()
 
-    if not prod:
-        session["msg"] = f"❌ Brak produktu o kodzie: {kod}"
-        session["msg_type"] = "error"
-    else:
-        koszyk = session.get("koszyk", {})
-        koszyk[kod] = koszyk.get(kod, 0) + 1
-        session["koszyk"] = koszyk
-        session["msg"] = f"✅ Dodano: {prod['nazwa']}"
-        session["msg_type"] = "success"
-
-    return redirect(url_for("home"))
-
-@app.route("/koszyk/zmien_ilosc", methods=["POST"])
-def koszyk_zmien_ilosc():
-    kod = request.form.get("kod")
-    try:
-        ilosc = float(request.form.get("ilosc", 1))
-        koszyk = session.get("koszyk", {})
-        if kod in koszyk:
-            if ilosc <= 0:
-                del koszyk[kod]
-            else:
-                koszyk[kod] = ilosc
-            session["koszyk"] = koszyk
-    except ValueError:
-        pass
-    return redirect(url_for("home"))
-
-@app.route("/koszyk/usun/<kod>")
-def koszyk_usun(kod):
-    koszyk = session.get("koszyk", {})
-    if kod in koszyk:
-        del koszyk[kod]
+    if prod:
+        koszyk = session.get("koszyk", [])
+        znaleziono = False
+        for item in koszyk:
+            if item["kod_kreskowy"] == kod:
+                item["ilosc"] += 1
+                znaleziono = True
+                break
+        if not znaleziono:
+            koszyk.append({
+                "kod_kreskowy": prod["kod_kreskowy"],
+                "nazwa": prod["nazwa"],
+                "cena": prod["cena"],
+                "ilosc": 1
+            })
         session["koszyk"] = koszyk
     return redirect(url_for("home"))
 
-@app.route("/koszyk/wyczysc")
-def koszyk_wyczysc():
-    session.pop("koszyk", None)
-    return redirect(url_for("home"))
+    conn.commit()
+    conn.close()
+
+    session["ostatnia_transakcja"] = {"id": transakcja_id}
+    session["koszyk"] = []
+
+    return redirect(url_for("platnosc_sukces"))
 
 
 # ----------------------------------------------------
-# PANEL ADMINA + RAPORTY I HISTORIA
+# PANEL ADMINISTRATORA
 # ----------------------------------------------------
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
     error = ""
     if request.method == "POST":
         haslo = request.form.get("haslo")
-        if haslo == "admin123":
+        if haslo == ADMIN_PASSWORD:
             session["admin"] = True
             return redirect(url_for("admin_panel"))
         else:
-            error = "❌ Niepoprawne hasło!"
+            error = "❌ Nieprawidłowe hasło!"
 
     content = f"""
-        <h2>🔒 Logowanie Admina</h2>
-        <p style="color: red;">{error}</p>
-        <form method="POST">
-            <input type="password" name="haslo" placeholder="Hasło (admin123)" required>
-            <button type="submit" class="btn btn-blue">Zaloguj</button>
-        </form>
-        <a href="/">← Powrót</a>
+        <div style="max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+            <h2>🔒 Logowanie Admina</h2>
+            {f'<div class="alert alert-error">{error}</div>' if error else ''}
+            <form method="POST">
+                <div style="margin-bottom: 15px;">
+                    <label><b>Hasło:</b></label><br>
+                    <input type="password" name="haslo" style="width: 100%; margin-top: 5px;" required>
+                </div>
+                <button type="submit" class="btn btn-blue" style="width: 100%;">Zaloguj się</button>
+            </form>
+        </div>
     """
     return render_template_string(HTML_LAYOUT, content=content)
+
 
 @app.route("/admin/logout")
 def admin_logout():
     session.pop("admin", None)
     return redirect(url_for("home"))
+
 
 @app.route("/admin")
 def admin_panel():
@@ -628,49 +305,42 @@ def admin_panel():
     produkty = conn.execute("SELECT * FROM produkty").fetchall()
     conn.close()
 
-    rows = ""
+    rows_html = ""
     for p in produkty:
-        rows += f"""
+        rows_html += f"""
         <tr>
             <td>{p['id']}</td>
-            <td><b>{p['nazwa']}</b></td>
+            <td>{p['nazwa']}</td>
             <td><code>{p['kod_kreskowy']}</code></td>
             <td>{p['cena']:.2f} zł</td>
             <td>{p['kategoria']}</td>
             <td>
-                <a href="/admin/edytuj/{p['id']}" class="btn btn-orange" style="padding: 4px 8px; font-size: 13px;">Edytuj</a>
-                <a href="/admin/usun/{p['id']}" class="btn btn-red" style="padding: 4px 8px; font-size: 13px;" onclick="return confirm('Usuń?')">Usuń</a>
+                <a href="/admin/edytuj/{p['id']}" class="btn btn-blue">✏️ Edytuj</a>
+                <a href="/admin/usun/{p['id']}" class="btn btn-red" onclick="return confirm('Czy na pewno usunąć produkt?')">🗑️ Usuń</a>
             </td>
         </tr>
         """
 
     content = f"""
-        <div class="header-nav">
-            <h2>⚙️ Panel Administratora</h2>
-            <div>
-                <a href="/admin/transakcje" class="btn btn-orange">📜 Historia i Raporty</a>
-                <a href="/admin/dodaj" class="btn btn-green">+ Dodaj Produkt</a>
-                <a href="/admin/logout" class="btn btn-red">Wyloguj</a>
-            </div>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+            <h2>⚙️ Zarządzanie Asortymentem</h2>
+            <a href="/admin/dodaj" class="btn btn-green">➕ Dodaj Nowy Produkt</a>
         </div>
-        <h3>📦 Lista Produktów w Bazie</h3>
         <table>
             <thead>
                 <tr>
                     <th>ID</th>
                     <th>Nazwa</th>
-                    <th>Kod</th>
+                    <th>Kod kreskowy</th>
                     <th>Cena</th>
                     <th>Kategoria</th>
                     <th>Akcje</th>
                 </tr>
             </thead>
             <tbody>
-                {rows if rows else '<tr><td colspan="6">Brak produktów. Dodaj pierwszy!</td></tr>'}
+                {rows_html if produkty else '<tr><td colspan="6" style="text-align:center;">Brak produktów w bazie.</td></tr>'}
             </tbody>
         </table>
-        <br>
-        <a href="/" class="btn btn-blue">← Powrót do Kasy</a>
     """
     return render_template_string(HTML_LAYOUT, content=content)
 
@@ -682,71 +352,34 @@ def admin_transakcje():
 
     conn = get_db_connection()
     transakcje = conn.execute("SELECT * FROM transakcje ORDER BY id DESC").fetchall()
-
-    # Wyliczanie statystyk
-    obrot_total = conn.execute("SELECT SUM(suma) FROM transakcje").fetchone()[0] or 0.0
-    liczba_transakcji = conn.execute("SELECT COUNT(*) FROM transakcje").fetchone()[0] or 0
-    
-    obrot_gotowka = conn.execute("SELECT SUM(suma) FROM transakcje WHERE metoda_platnosci = 'Gotówka'").fetchone()[0] or 0.0
-    obrot_karta = conn.execute("SELECT SUM(suma) FROM transakcje WHERE metoda_platnosci = 'Karta'").fetchone()[0] or 0.0
-    obrot_blik = conn.execute("SELECT SUM(suma) FROM transakcje WHERE metoda_platnosci = 'BLIK'").fetchone()[0] or 0.0
-
     conn.close()
 
-    rows = ""
+    rows_html = ""
     for t in transakcje:
-        rows += f"""
+        rows_html += f"""
         <tr>
-            <td><b>#{t['id']}</b></td>
+            <td>#{t['id']}</td>
             <td>{t['data_czas']}</td>
             <td><b>{t['suma']:.2f} zł</b></td>
-            <td><span class="btn btn-gray" style="padding: 2px 8px; font-size: 12px;">{t['metoda_platnosci']}</span></td>
-            <td>
-                <a href="/admin/transakcja/{t['id']}" class="btn btn-blue" style="padding: 4px 8px; font-size: 13px;">👁️ Podgląd paragonu</a>
-            </td>
+            <td>{t['metoda_platnosci']}</td>
+            <td><a href="/admin/transakcja/{t['id']}" class="btn btn-blue">🔍 Szczegóły</a></td>
         </tr>
         """
 
     content = f"""
-        <div class="header-nav">
-            <h2>📊 Historia Sprzedaży i Raporty</h2>
-            <div>
-                <a href="/admin" class="btn btn-gray">← Powrót do Produktów</a>
-            </div>
-        </div>
-
-        <div class="stats-grid">
-            <div class="stat-card">
-                <h4>ŁĄCZNY OBRÓT</h4>
-                <p style="color: #2ecc71;">{obrot_total:.2f} zł</p>
-            </div>
-            <div class="stat-card">
-                <h4>LICZBA TRANSAKCJI</h4>
-                <p>{liczba_transakcji}</p>
-            </div>
-            <div class="stat-card">
-                <h4>GOTÓWKA</h4>
-                <p>{obrot_gotowka:.2f} zł</p>
-            </div>
-            <div class="stat-card">
-                <h4>KARTA / BLIK</h4>
-                <p>{(obrot_karta + obrot_blik):.2f} zł</p>
-            </div>
-        </div>
-
-        <h3>📜 Lista Transakcji:</h3>
+        <h2>📜 Historia Transakcji</h2>
         <table>
             <thead>
                 <tr>
                     <th>ID</th>
-                    <th>Data i Czas</th>
+                    <th>Data i czas</th>
                     <th>Suma</th>
-                    <th>Metoda</th>
+                    <th>Metoda Płatności</th>
                     <th>Szczegóły</th>
                 </tr>
             </thead>
             <tbody>
-                {rows if rows else '<tr><td colspan="5" style="text-align: center; color: #7f8c8d;">Brak zarejestrowanych transakcji.</td></tr>'}
+                {rows_html if transakcje else '<tr><td colspan="5" style="text-align:center;">Brak zarejestrowanych transakcji.</td></tr>'}
             </tbody>
         </table>
     """
@@ -759,32 +392,28 @@ def admin_transakcja_szczegoly(id):
         return redirect(url_for("admin_login"))
 
     conn = get_db_connection()
-    t = conn.execute("SELECT * FROM transakcje WHERE id = ?", (id,)).fetchone()
-    if not t:
-        conn.close()
-        return redirect(url_for("admin_transakcje"))
-
+    transakcja = conn.execute("SELECT * FROM transakcje WHERE id = ?", (id,)).fetchone()
     pozycje = conn.execute("SELECT * FROM transakcje_pozycje WHERE transakcja_id = ?", (id,)).fetchall()
     conn.close()
 
-    rows = ""
+    if not transakcja:
+        return redirect(url_for("admin_transakcje"))
+
+    pozycje_html = ""
     for p in pozycje:
-        rows += f"""
+        pozycje_html += f"""
         <tr>
-            <td><b>{p['nazwa_produktu']}</b></td>
-            <td>{p['cena_jedn']:.2f} zł</td>
+            <td>{p['nazwa_produktu']}</td>
+            <td>{p['cena_jednostkowa']:.2f} zł</td>
             <td>{p['ilosc']}</td>
-            <td><b>{p['wartosc']:.2f} zł</b></td>
+            <td>{p['wartosc']:.2f} zł</td>
         </tr>
         """
 
     content = f"""
-        <h2>🧾 Szczegóły Transakcji #{t['id']}</h2>
-        <p><b>Data i Czas:</b> {t['data_czas']}</p>
-        <p><b>Metoda Płatności:</b> {t['metoda_platnosci']}</p>
-        {"<p><b>Wpłacono:</b> " + f"{t['wplacono']:.2f}" + " zł | <b>Reszta:</b> " + f"{t['reszta']:.2f}" + " zł</p>" if t['metoda_platnosci'] == "Gotówka" else ""}
-
-        <h3>Pozycje na paragonie:</h3>
+        <h2>🔍 Szczegóły Transakcji #{transakcja['id']}</h2>
+        <p><b>Data:</b> {transakcja['data_czas']} | <b>Metoda:</b> {transakcja['metoda_platnosci']} | <b>Suma:</b> {transakcja['suma']:.2f} zł</p>
+        
         <table>
             <thead>
                 <tr>
@@ -795,14 +424,9 @@ def admin_transakcja_szczegoly(id):
                 </tr>
             </thead>
             <tbody>
-                {rows}
+                {pozycje_html}
             </tbody>
         </table>
-
-        <div class="summary" style="margin-top: 20px;">
-            Suma całkowita: <span>{t['suma']:.2f} zł</span>
-        </div>
-
         <br>
         <a href="/admin/transakcje" class="btn btn-blue">← Powrót do historii</a>
     """
@@ -816,38 +440,60 @@ def admin_dodaj():
 
     error = ""
     if request.method == "POST":
-        nazwa = request.form.get("nazwa")
-        kod = request.form.get("kod_kreskowy")
-        cena = request.form.get("cena")
-        kategoria = request.form.get("kategoria")
+        nazwa = request.form.get("nazwa", "").strip()
+        kod_kreskowy = request.form.get("kod_kreskowy", "").strip()
+        cena_str = request.form.get("cena", "0").replace(",", ".")
+        kategoria = request.form.get("kategoria", "Inne").strip()
 
         try:
-            conn = get_db_connection()
-            conn.execute(
-                "INSERT INTO produkty (nazwa, kod_kreskowy, cena, kategoria) VALUES (?, ?, ?, ?)",
-                (nazwa, kod, float(cena), kategoria)
-            )
-            conn.commit()
-            conn.close()
-            return redirect(url_for("admin_panel"))
+            cena = float(cena_str)
+            if not nazwa or not kod_kreskowy:
+                error = "❌ Wypełnij wszystkie pola!"
+            else:
+                conn = get_db_connection()
+                conn.execute(
+                    "INSERT INTO produkty (nazwa, kod_kreskowy, cena, kategoria) VALUES (?, ?, ?, ?)",
+                    (nazwa, kod_kreskowy, cena, kategoria)
+                )
+                conn.commit()
+                conn.close()
+                return redirect(url_for("admin_panel"))
         except sqlite3.IntegrityError:
-            error = "❌ Kod kreskowy już istnieje!"
-        except Exception as e:
-            error = f"❌ Błąd: {e}"
+            error = f"❌ Produkt z kodem '{kod_kreskowy}' już istnieje!"
+        except ValueError:
+            error = "❌ Niepoprawna cena!"
 
     content = f"""
-        <h2>➕ Dodaj Produkt</h2>
-        <p style="color: red;">{error}</p>
+        <h2>➕ Dodaj Nowy Produkt</h2>
+        {f'<div class="alert alert-error">{error}</div>' if error else ''}
+
         <form method="POST">
-            <input type="text" name="nazwa" placeholder="Nazwa" required>
-            <input type="text" name="kod_kreskowy" placeholder="Kod kreskowy" required>
-            <input type="number" step="0.01" name="cena" placeholder="Cena" required>
-            <input type="text" name="kategoria" placeholder="Kategoria" required>
-            <button type="submit" class="btn btn-green">Zapisz</button>
+            <div style="display: flex; flex-direction: column; gap: 15px; max-width: 500px;">
+                <label>
+                    <b>Nazwa produktu:</b><br>
+                    <input type="text" name="nazwa" style="width: 100%;" required>
+                </label>
+                <label>
+                    <b>Kod kreskowy:</b><br>
+                    <input type="text" name="kod_kreskowy" style="width: 100%;" required>
+                </label>
+                <label>
+                    <b>Cena (PLN):</b><br>
+                    <input type="number" step="0.01" name="cena" style="width: 100%;" required>
+                </label>
+                <label>
+                    <b>Kategoria:</b><br>
+                    <input type="text" name="kategoria" value="Ogólna" style="width: 100%;" required>
+                </label>
+                <div style="margin-top: 10px;">
+                    <button type="submit" class="btn btn-green">💾 Zapisz produkt</button>
+                    <a href="/admin" class="btn btn-gray">Anuluj</a>
+                </div>
+            </div>
         </form>
-        <a href="/admin">← Anuluj</a>
     """
     return render_template_string(HTML_LAYOUT, content=content)
+
 
 @app.route("/admin/edytuj/<int:id>", methods=["GET", "POST"])
 def admin_edytuj(id):
@@ -855,36 +501,66 @@ def admin_edytuj(id):
         return redirect(url_for("admin_login"))
 
     conn = get_db_connection()
-    produkt = conn.execute("SELECT * FROM produkty WHERE id = ?", (id,)).fetchone()
+    prod = conn.execute("SELECT * FROM produkty WHERE id = ?", (id,)).fetchone()
 
-    if request.method == "POST":
-        nazwa = request.form.get("nazwa")
-        kod = request.form.get("kod_kreskowy")
-        cena = request.form.get("cena")
-        kategoria = request.form.get("kategoria")
-
-        conn.execute(
-            "UPDATE produkty SET nazwa = ?, kod_kreskowy = ?, cena = ?, kategoria = ? WHERE id = ?",
-            (nazwa, kod, float(cena), kategoria, id)
-        )
-        conn.commit()
+    if not prod:
         conn.close()
         return redirect(url_for("admin_panel"))
+
+    error = ""
+    if request.method == "POST":
+        nazwa = request.form.get("nazwa", "").strip()
+        kod_kreskowy = request.form.get("kod_kreskowy", "").strip()
+        cena_str = request.form.get("cena", "0").replace(",", ".")
+        kategoria = request.form.get("kategoria", "").strip()
+
+        try:
+            cena = float(cena_str)
+            conn.execute(
+                "UPDATE produkty SET nazwa = ?, kod_kreskowy = ?, cena = ?, kategoria = ? WHERE id = ?",
+                (nazwa, kod_kreskowy, cena, kategoria, id)
+            )
+            conn.commit()
+            conn.close()
+            return redirect(url_for("admin_panel"))
+        except sqlite3.IntegrityError:
+            error = f"❌ Kod kreskowy '{kod_kreskowy}' jest używany przez inny produkt!"
+        except ValueError:
+            error = "❌ Niepoprawna cena!"
 
     conn.close()
 
     content = f"""
-        <h2>✏️ Edytuj Produkt</h2>
+        <h2>✏️ Edytuj Produkt #{prod['id']}</h2>
+        {f'<div class="alert alert-error">{error}</div>' if error else ''}
+
         <form method="POST">
-            <input type="text" name="nazwa" value="{produkt['nazwa']}" required>
-            <input type="text" name="kod_kreskowy" value="{produkt['kod_kreskowy']}" required>
-            <input type="number" step="0.01" name="cena" value="{produkt['cena']}" required>
-            <input type="text" name="kategoria" value="{produkt['kategoria']}" required>
-            <button type="submit" class="btn btn-orange">Zapisz</button>
+            <div style="display: flex; flex-direction: column; gap: 15px; max-width: 500px;">
+                <label>
+                    <b>Nazwa produktu:</b><br>
+                    <input type="text" name="nazwa" value="{prod['nazwa']}" style="width: 100%;" required>
+                </label>
+                <label>
+                    <b>Kod kreskowy:</b><br>
+                    <input type="text" name="kod_kreskowy" value="{prod['kod_kreskowy']}" style="width: 100%;" required>
+                </label>
+                <label>
+                    <b>Cena (PLN):</b><br>
+                    <input type="number" step="0.01" name="cena" value="{prod['cena']:.2f}" style="width: 100%;" required>
+                </label>
+                <label>
+                    <b>Kategoria:</b><br>
+                    <input type="text" name="kategoria" value="{prod['kategoria']}" style="width: 100%;" required>
+                </label>
+                <div style="margin-top: 10px;">
+                    <button type="submit" class="btn btn-blue">💾 Zapisz zmiany</button>
+                    <a href="/admin" class="btn btn-gray">Anuluj</a>
+                </div>
+            </div>
         </form>
-        <a href="/admin">← Anuluj</a>
     """
     return render_template_string(HTML_LAYOUT, content=content)
+
 
 @app.route("/admin/usun/<int:id>")
 def admin_usun(id):
@@ -895,11 +571,92 @@ def admin_usun(id):
     conn.execute("DELETE FROM produkty WHERE id = ?", (id,))
     conn.commit()
     conn.close()
+
     return redirect(url_for("admin_panel"))
 
 
-import os
+# ----------------------------------------------------
+# PODSUMOWANIE TRANSAKCJI / PARAGON
+# ----------------------------------------------------
+@app.route("/platnosc/sukces")
+def platnosc_sukces():
+    t_data = session.get("ostatnia_transakcja")
+    if not t_data:
+        return redirect(url_for("home"))
 
+    conn = get_db_connection()
+    transakcja = conn.execute("SELECT * FROM transakcje WHERE id = ?", (t_data["id"],)).fetchone()
+    pozycje = conn.execute("SELECT * FROM transakcje_pozycje WHERE transakcja_id = ?", (t_data["id"],)).fetchall()
+    conn.close()
+
+    pozycje_html = ""
+    for p in pozycje:
+        pozycje_html += f"""
+        <tr>
+            <td style="padding: 4px 0;">{p['nazwa_produktu']}</td>
+            <td style="padding: 4px 0; text-align: center;">{p['ilosc']}</td>
+            <td style="padding: 4px 0; text-align: right;">{p['wartosc']:.2f}</td>
+        </tr>
+        """
+
+    content = f"""
+        <div style="text-align: center; margin-bottom: 20px;">
+            <h2 style="color: #2ecc71; margin-bottom: 5px;">🎉 Transakcja Zakończona Sukcesem!</h2>
+            <p>Dziękujemy za zakupy.</p>
+        </div>
+
+        <!-- WIZUALIZACJA PARAGONU -->
+        <div id="paragon" style="max-width: 320px; margin: 0 auto; background: #fff8e7; padding: 20px; border: 1px dashed #aaa; font-family: 'Courier New', Courier, monospace; color: #000; box-shadow: 0 4px 10px rgba(0,0,0,0.05);">
+            <div style="text-align: center; border-bottom: 1px dashed #000; padding-bottom: 10px; margin-bottom: 10px;">
+                <h3 style="margin: 0; font-size: 1.2em;">SKLEP MONOPOLOWO-SPOŻYWCZY</h3>
+                <small>ul. Przykładowa 12, Warszawa</small><br>
+                <small>NIP: 123-456-78-90</small>
+            </div>
+
+            <div style="font-size: 0.85em; margin-bottom: 10px;">
+                PARAGON FISKALNY #{transakcja['id']}<br>
+                Data: {transakcja['data_czas']}
+            </div>
+
+            <table style="width: 100%; font-size: 0.85em; border-collapse: collapse;">
+                <thead>
+                    <tr style="border-bottom: 1px solid #000;">
+                        <th style="text-align: left; padding-bottom: 4px;">Nazwa</th>
+                        <th style="text-align: center; padding-bottom: 4px;">Ilość</th>
+                        <th style="text-align: right; padding-bottom: 4px;">Wartość</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {pozycje_html}
+                </tbody>
+            </table>
+
+            <div style="border-top: 1px dashed #000; margin-top: 10px; padding-top: 10px; font-weight: bold; font-size: 1.1em; display: flex; justify-content: space-between;">
+                <span>SUMA PLN:</span>
+                <span>{transakcja['suma']:.2f}</span>
+            </div>
+
+            <div style="font-size: 0.85em; margin-top: 8px;">
+                Forma płatności: {transakcja['metoda_platnosci']}<br>
+                {"Wpłacono: " + f"{transakcja['wplacono']:.2f} zł" if transakcja['metoda_platnosci'] == "Gotówka" else ""}<br>
+                {"Reszta: " + f"{transakcja['reszta']:.2f} zł" if transakcja['metoda_platnosci'] == "Gotówka" else ""}
+            </div>
+
+            <div style="text-align: center; margin-top: 15px; border-top: 1px dashed #000; padding-top: 10px; font-size: 0.8em;">
+                *** DZIĘKUJEMY I ZAPRASZAMY PONOWNIE ***
+            </div>
+        </div>
+
+        <div style="text-align: center; margin-top: 25px; display: flex; justify-content: center; gap: 10px;">
+            <button onclick="window.print()" class="btn btn-blue">🖨️ Drukuj Paragon</button>
+            <a href="/" class="btn btn-green">🛒 Nowa Transakcja</a>
+        </div>
+    """
+    return render_template_string(HTML_LAYOUT, content=content)
+
+
+# ----------------------------------------------------
+# START APLIKACJI
+# ----------------------------------------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(debug=True, host="0.0.0.0", port=5000)
